@@ -7,6 +7,12 @@ function env(key: string, fallback: string): string {
   return process.env[key] ?? fallback
 }
 
+function required(key: string): string {
+  const val = process.env[key]
+  if (!val) throw new Error(`[appSettings] Missing required env var: ${key}`)
+  return val
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const OVERRIDES_PATH  = resolve(__dirname, '../../runtime-config.json')
 const LAST_RUN_PATH   = resolve(__dirname, '../../runtime-lastrun.json')
@@ -96,10 +102,10 @@ const settings = {
   logLevel: env('LOG_LEVEL', 'info') as 'debug' | 'info' | 'warn' | 'error',
 
   /** Absolute path to snowsignals runner binary */
-  runnerPath: env('RUNNER_PATH', '/Users/kenyMobile/Desktop/ssModel/model/target/release/runner'),
+  runnerPath: required('RUNNER_PATH'),
 
   /** Base directory for snowsignals config */
-  configDir: env('SNOWSIGNALS_CONFIG_DIR', '/Users/kenyMobile/Desktop/ssModel/model/config'),
+  configDir: required('SNOWSIGNALS_CONFIG_DIR'),
 
   /** Oracle service URL for posting run envelopes (direct internal port, not webserv proxy) */
   oracleUrl: env('ORACLE_URL', 'http://localhost:3003'),
