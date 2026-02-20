@@ -10,9 +10,10 @@ const TF_MS: Record<MtfTimeframe, number> = {
   '15m': 15 * 60 * 1000,
   '4h':  4 * 60 * 60 * 1000,
   '1d':  24 * 60 * 60 * 1000,
+  '7d':  7 * 24 * 60 * 60 * 1000,
 }
 
-const MTF_TIMEFRAMES: MtfTimeframe[] = ['15m', '4h', '1d']
+const MTF_TIMEFRAMES: MtfTimeframe[] = ['15m', '4h', '1d', '7d']
 
 export class LiveScheduler extends EventEmitter {
   private lastFired = new Map<MtfTimeframe, number>()

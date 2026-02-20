@@ -24,7 +24,7 @@ export interface DataservMessage {
 }
 
 /** Supported MTF timeframes */
-export type MtfTimeframe = '15m' | '4h' | '1d'
+export type MtfTimeframe = '15m' | '4h' | '1d' | '7d'
 
 /** Run source type */
 export type RunSource = 'live' | 'paper'

@@ -7,20 +7,18 @@
  *
  * On each MTF boundary:
  *   1. Run SS model with candle array
- *   2. Save result to ss_model_runs (cursor DB)
- *   3. POST envelope to oracle (fire-and-forget)
+ *   2. POST full envelope to oracle (awaited — oracle writes ss_model_runs, responds { runId })
+ *   3. Broadcast WS with oracle's runId
  *
- * Startup catch-up: reads MAX(boundary_ts) per timeframe from DB and runs
- * any missed intervals since last restart.
+ * Startup catch-up: reads last-run boundaries from runtime-lastrun.json (written after
+ * each successful oracle delivery). DB is no longer used by ltfserv.
  */
 import 'dotenv/config'
 import http from 'node:http'
 import express from 'express'
 
-import settings from './config/appSettings.js'
+import settings, { loadLastRuns, saveLastRun } from './config/appSettings.js'
 import { logger } from './helpers/logger.js'
-import { closePool } from './db/pool.js'
-import { insertRun, deletePaperRuns, getLastRunTs } from './db/runHistory.js'
 import { registerProcess, deregisterProcess } from './db/processRegistry.js'
 import { executeRunner, buildRunnerInput } from './engine/modelRunner.js'
 import { LiveScheduler } from './engine/scheduler.js'
@@ -28,12 +26,12 @@ import { UnixSocketClient } from './servers/unixSocketClient.js'
 import { attachWsServer, broadcast, getClientCount, closeWsServer } from './servers/wsServer.js'
 import { createRouter } from './servers/restApi.js'
 import { reportError } from './helpers/reportError.js'
-import type { MtfTimeframe, Candle, RunSource } from './types/index.js'
+import type { MtfTimeframe, Candle, RunSource, MtfModelConfig, RunnerOutput } from './types/index.js'
 
 // ── State ─────────────────────────────────────────────────────
 
 let mode: 'paper' | 'live' = 'live'
-const lastRun: Record<string, number | null> = { '15m': null, '4h': null, '1d': null }
+const lastRun: Record<string, number | null> = { '15m': null, '4h': null, '1d': null, '7d': null }
 
 const scheduler = new LiveScheduler()
 const upstream = new UnixSocketClient()
@@ -44,12 +42,14 @@ const BINANCE_INTERVAL: Record<MtfTimeframe, string> = {
   '15m': '15m',
   '4h':  '4h',
   '1d':  '1d',
+  '7d':  '1w',   // Binance uses '1w' for weekly candles (Mon 00:00 UTC boundaries)
 }
 
 const TF_MS: Record<MtfTimeframe, number> = {
   '15m': 15 * 60 * 1000,
   '4h':  4 * 60 * 60 * 1000,
   '1d':  24 * 60 * 60 * 1000,
+  '7d':  7 * 24 * 60 * 60 * 1000,
 }
 
 async function fetchBinanceCandles(tf: MtfTimeframe, limit: number): Promise<Candle[]> {
@@ -78,17 +78,59 @@ async function fetchBinanceCandles(tf: MtfTimeframe, limit: number): Promise<Can
 
 // ── Oracle POST ────────────────────────────────────────────────
 
-async function postToOracle(tf: string, boundaryTs: number, runId: number | null, output: unknown): Promise<void> {
+/**
+ * POST the full run envelope to oracle and await its DB row id.
+ * Oracle is now the sole writer of ss_model_runs.
+ * Returns the oracle-assigned DB row id, or null on failure.
+ */
+async function postToOracle(
+  tf: MtfTimeframe,
+  boundaryTs: number,
+  source: RunSource,
+  config: MtfModelConfig,
+  candles: Candle[],
+  output: RunnerOutput,
+): Promise<number | null> {
+  const args = {
+    source:          config.source,
+    maType:          config.maType,
+    slowLength:      config.slowLength,
+    fastLength:      config.fastLength,
+    signalSmoothing: config.signalSmoothing,
+  }
+
+  const payload = {
+    timeframe:  tf,
+    boundaryTs,
+    modelDate:  candles[candles.length - 1]?.timestamp ?? boundaryTs,
+    runId:      output.runId,    // runner's own ID
+    source,
+    formula:    config.formula,
+    args,
+    output,
+  }
+
   try {
-    await fetch(`${settings.oracleUrl}/api/ltf`, {
+    const res = await fetch(`${settings.oracleUrl}/ltf/run`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ timeframe: tf, boundaryTs, runId, output }),
+      headers: {
+        'Content-Type':   'application/json',
+        'X-Internal-Key': settings.internalApiKey,
+      },
+      body: JSON.stringify(payload),
     })
-    logger.info(`Oracle POST OK for ${tf}`)
+
+    if (!res.ok) {
+      logger.error(`Oracle POST failed for ${tf}: HTTP ${res.status}`)
+      return null
+    }
+
+    const body = await res.json() as { ok: boolean; runId: number | null }
+    logger.info(`Oracle POST OK for ${tf} — runId=${body.runId}`)
+    return body.runId ?? null
   } catch (err) {
-    logger.error(`Oracle POST failed for ${tf}`, err)
-    // Continue — run was already saved to DB
+    logger.error(`Oracle POST error for ${tf}:`, err)
+    return null
   }
 }
 
@@ -113,19 +155,22 @@ async function runModel(
     const { output, durationMs } = await executeRunner(input)
 
     // Attach raw signal prices so the frontend can display actual BTC prices
-    // (runner output uses normalized screen coordinates; signal has real prices)
     output.prices = input.signal
 
     lastRun[tf] = boundaryTs
 
-    // Save to DB (fire and forget oracle, but wait for DB)
-    const runId = await insertRun(tf, boundaryTs, source, config, output)
+    // POST to oracle (awaited — oracle writes to ss_model_runs and returns runId)
+    const runId = await postToOracle(tf, boundaryTs, source, config, candles, output)
+    if (runId === null) {
+      reportError(`runModel/${tf}`, new Error('Oracle POST failed — watchdog will handle missed boundary'))
+      // Do NOT persist lastRun — oracle didn't acknowledge; watchdog will re-trigger
+    } else {
+      // Oracle confirmed receipt — safe to persist boundary as completed
+      saveLastRun(tf, boundaryTs)
+    }
 
-    // Broadcast to WS clients
+    // Broadcast to WS clients with oracle's DB row id (null if oracle was unreachable)
     broadcast({ type: 'ltf_run', timeframe: tf, boundaryTs, source, runId, output })
-
-    // POST to oracle (fire-and-forget)
-    postToOracle(tf, boundaryTs, runId, output).catch(() => {})
 
     logger.info(`${tf} run complete: runId=${runId}, duration=${durationMs}ms`)
   } catch (err) {
@@ -147,7 +192,7 @@ function enablePaperMode(): void {
 function enableLiveMode(): void {
   if (mode === 'live') return
   mode = 'live'
-  // Re-read last runs from DB and restart scheduler
+  // Re-init scheduler from saved last-run state
   initLiveScheduler().catch(err => logger.error('Failed to reinit live scheduler', err))
   logger.info('Switched to live mode')
   broadcast({ type: 'mode', mode: 'live' })
@@ -157,13 +202,13 @@ function enableLiveMode(): void {
 
 async function initLiveScheduler(): Promise<void> {
   const tfs: MtfTimeframe[] = ['15m', '4h', '1d']
+  const saved = loadLastRuns()
   const initial: Partial<Record<MtfTimeframe, number>> = {}
 
   for (const tf of tfs) {
-    const last = await getLastRunTs(tf, 'live')
-    if (last !== null) {
-      initial[tf] = last
-      lastRun[tf] = last
+    if (saved[tf] != null) {
+      initial[tf] = saved[tf]!
+      lastRun[tf] = saved[tf]!
     }
   }
 
@@ -176,8 +221,16 @@ upstream.on('paperOn', enablePaperMode)
 upstream.on('paperOff', enableLiveMode)
 
 upstream.on('paper_loop', async () => {
-  logger.info('Paper loop reset detected — purging paper runs')
-  await deletePaperRuns()
+  logger.info('Paper loop reset detected — purging paper runs via oracle')
+  try {
+    await fetch(`${settings.oracleUrl}/paper/purge-ltf`, {
+      method: 'POST',
+      headers: { 'X-Internal-Key': settings.internalApiKey },
+    })
+    logger.info('Paper purge via oracle OK')
+  } catch (err) {
+    reportError('paper_loop/purge', err)
+  }
 })
 
 upstream.on('mtf_candles', async (event: {
@@ -216,6 +269,12 @@ app.use('/', createRouter({
   getMode: () => mode,
   getLastRun: () => ({ ...lastRun }),
   isUpstreamConnected: () => upstream.isConnected(),
+  triggerRun: async (tf: MtfTimeframe) => {
+    const ms = TF_MS[tf]
+    const boundaryTs = Math.floor(Date.now() / ms) * ms
+    const candles = await fetchBinanceCandles(tf, 176)
+    await runModel(tf, boundaryTs, candles, 'live')
+  },
 }))
 
 const httpServer = http.createServer(app)
@@ -240,7 +299,7 @@ async function start(): Promise<void> {
   // Connect to dataserv socket for paper mode events
   upstream.connect()
 
-  // Start live scheduler with catch-up
+  // Start live scheduler with catch-up from runtime-lastrun.json
   await initLiveScheduler()
 
   logger.info('=== ltfserv ready ===')
@@ -261,7 +320,6 @@ async function shutdown(signal: string): Promise<void> {
   upstream.close()
   closeWsServer()
   httpServer.close()
-  await closePool()
 
   logger.info('ltfserv shutdown complete')
   process.exit(0)
@@ -272,5 +330,5 @@ process.on('SIGINT', () => shutdown('SIGINT'))
 
 start().catch(err => {
   logger.error('ltfserv failed to start', err)
-  closePool().then(() => process.exit(1))
+  process.exit(1)
 })

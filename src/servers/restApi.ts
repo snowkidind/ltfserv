@@ -5,16 +5,16 @@
 import express from 'express'
 import settings, { saveConfigs } from '../config/appSettings.js'
 import { logger } from '../helpers/logger.js'
-import { getRuns, getRunById } from '../db/runHistory.js'
-import type { MtfTimeframe, RunSource } from '../types/index.js'
+import type { MtfTimeframe } from '../types/index.js'
 
 const VALID_TIMEFRAMES: MtfTimeframe[] = ['15m', '4h', '1d']
-const VALID_SOURCES: RunSource[] = ['live', 'paper']
 
 interface StatusProvider {
   getMode: () => 'paper' | 'live'
   getLastRun: () => Record<string, number | null>
   isUpstreamConnected: () => boolean
+  /** Force a model run for a timeframe outside the normal schedule. Called by oracle watchdog. */
+  triggerRun: (tf: MtfTimeframe) => Promise<void>
 }
 
 export function createRouter(statusProvider: StatusProvider): express.Router {
@@ -98,49 +98,24 @@ export function createRouter(statusProvider: StatusProvider): express.Router {
     res.json({ ok: true, timeframe: tf, config: cfg })
   })
 
-  // ── History ───────────────────────────────────────────────────
+  // ── Manual trigger (called by oracle watchdog on missed boundary) ─────────
 
-  router.get('/history', async (req, res) => {
-    const timeframe = req.query.timeframe as MtfTimeframe | undefined
-    const source = req.query.source as RunSource | undefined
-    const limit = Math.min(parseInt(String(req.query.limit || '50'), 10), 200)
-    const before = req.query.before ? parseInt(String(req.query.before), 10) : undefined
-
-    if (timeframe && !VALID_TIMEFRAMES.includes(timeframe)) {
-      res.status(400).json({ error: `timeframe must be one of: ${VALID_TIMEFRAMES.join(', ')}` })
+  router.post('/trigger/:tf', async (req, res) => {
+    const tf = req.params.tf as MtfTimeframe
+    if (!VALID_TIMEFRAMES.includes(tf)) {
+      res.status(400).json({ error: `tf must be one of: ${VALID_TIMEFRAMES.join(', ')}` })
       return
     }
-    if (source && !VALID_SOURCES.includes(source)) {
-      res.status(400).json({ error: `source must be one of: ${VALID_SOURCES.join(', ')}` })
+    if (statusProvider.getMode() !== 'live') {
+      res.status(409).json({ error: 'Cannot trigger run in paper mode' })
       return
     }
-
     try {
-      const result = await getRuns(timeframe, limit, before, source)
-      res.json(result)
+      await statusProvider.triggerRun(tf)
+      res.json({ ok: true, tf })
     } catch (err) {
-      logger.error('GET /history failed', err)
-      res.status(500).json({ error: 'Failed to fetch run history' })
-    }
-  })
-
-  router.get('/history/:id', async (req, res) => {
-    const id = parseInt(req.params.id, 10)
-    if (isNaN(id)) {
-      res.status(400).json({ error: 'Invalid id' })
-      return
-    }
-
-    try {
-      const run = await getRunById(id)
-      if (!run) {
-        res.status(404).json({ error: 'Run not found' })
-        return
-      }
-      res.json(run)
-    } catch (err) {
-      logger.error(`GET /history/${id} failed`, err)
-      res.status(500).json({ error: 'Failed to fetch run' })
+      logger.error(`POST /trigger/${tf} failed`, err)
+      res.status(500).json({ error: 'Trigger failed' })
     }
   })
 
